@@ -1,0 +1,38 @@
+# @package _global_
+
+defaults:
+  - JIT-Baseline
+  - override /dataset@dataset.train_dataset: train_fine_t2i_debug
+  - override /dataset@dataset.eval_dataset: train_fine_t2i_debug
+  - _self_
+
+group: JIT-Profile
+name: JIT-Profile
+
+global_batch_size: 8
+device_train_microbatch_size: 8
+device_eval_microbatch_size: 1
+
+eval_first: false
+
+compile_denoiser: false
+compile_vae: false
+
+trainer:
+  max_duration: 100ba
+  eval_interval: 1000000ba
+  eval_subset_num_batches: 1
+  device_train_microbatch_size: ${device_train_microbatch_size}
+  run_name: ${group}-${name}
+  save_folder: checkpoints/JIT-profile
+  save_interval: 1000000ba
+  save_num_checkpoints_to_keep: 1
+  save_overwrite: true
+  autoresume: false
+
+callbacks:
+  image_monitor: null
+  generation_metrics: null
+  optimizer_monitor:
+    _target_: composer.callbacks.OptimizerMonitor
+    batch_log_interval: 1000
