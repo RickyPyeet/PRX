@@ -32,6 +32,7 @@ import math
 import os
 import tarfile
 import time
+import csv
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from glob import glob
@@ -119,11 +120,11 @@ def closest_bucket(w: int, h: int) -> tuple[float, int, int]:
 # ---------------------------------------------------------------------------
 
 
-def iter_tar_samples(tar_path: str) -> Iterator[dict[str, bytes]]:
+def iter_tar_samples(tar_path: str) -> Iterator[tuple[str, dict[str, bytes]]]:
     """Stream samples from a tar one at a time.
 
     WebDataset tars group consecutive files by key (e.g. 00001.jpg, 00001.json).
-    Yields dicts with at least 'jpg' and 'json' keys.
+    Yields tuple with key id and dicts with at least 'jpg' and 'json' keys.
     """
     current_key: str | None = None
     current: dict[str, bytes] = {}
@@ -137,14 +138,14 @@ def iter_tar_samples(tar_path: str) -> Iterator[dict[str, bytes]]:
                 continue
             if key != current_key:
                 if current_key is not None and "jpg" in current and "json" in current:
-                    yield current
+                    yield current_key, current # add current_key to yield 
                 current_key = key
                 current = {}
             f = tf.extractfile(member)
             if f is not None:
                 current[ext] = f.read()
         if current_key is not None and "jpg" in current and "json" in current:
-            yield current
+            yield current_key, current # add current_key to yield
 
 
 # ---------------------------------------------------------------------------
@@ -211,7 +212,17 @@ def process_sample(
     except Exception:
         return None
 
+# ---------------------------------------------------------------------------
+# Extract Selected IDs
+# ---------------------------------------------------------------------------
 
+
+def load_selected_ids(csv_path: str) -> set[str]:
+    with open(csv_path, newline = "", encoding = 'utf-8') as f:
+        reader = csv.DictReader(f)
+        return {row['sample_id'] for row in reader}
+
+        
 # ---------------------------------------------------------------------------
 # Worker process
 # ---------------------------------------------------------------------------
@@ -223,6 +234,7 @@ def worker_fn(
     output_root: str,
     jpeg_quality: int,
     counter: "Value[int]",
+    selected_ids_path: str,
 ) -> None:
     log = logging.getLogger(f"w{worker_id}")
     writers: dict[str, MDSWriter] = {}
@@ -230,11 +242,16 @@ def worker_fn(
     n_failed = 0
     start = time.time()
 
+    selected_ids = load_selected_ids(selected_ids_path) # set of selected ids
+    log.info("Loaded %d selected sample IDs", len(selected_ids))
+    
     try:
         for tar_path in tar_files:
             subset = tar_path.rsplit("/", 2)[-2]
 
-            for raw in iter_tar_samples(tar_path):
+            for sample_id, raw in iter_tar_samples(tar_path):
+                if sample_id not in selected_ids:
+                    continue
                 result = process_sample(raw["jpg"], raw["json"], subset, jpeg_quality)
                 if result is None:
                     n_failed += 1
@@ -297,7 +314,7 @@ def merge_indexes(output_root: str) -> None:
 
 
 def run(
-    input_dir: str, output_root: str, num_workers: int, jpeg_quality: int,
+    input_dir: str, output_root: str, num_workers: int, jpeg_quality: int, selected_ids_path: str,
 ) -> None:
     os.makedirs(output_root, exist_ok=True)
 
@@ -322,7 +339,7 @@ def run(
             continue
         p = Process(
             target=worker_fn,
-            args=(i, worker_tars[i], output_root, jpeg_quality, counter),
+            args=(i, worker_tars[i], output_root, jpeg_quality, counter, selected_ids_path),
         )
         p.start()
         processes.append(p)
@@ -367,13 +384,14 @@ def main() -> None:
     parser.add_argument("--output", default="/mnt/data/datasets/gen_ai/fine-t2i")
     parser.add_argument("--workers", type=int, default=16)
     parser.add_argument("--jpeg-quality", type=int, default=JPEG_QUALITY)
+    parser.add_argument("--selected-ids", type = str, required = True, help = "CSV manifest containing the selected sample_id values")
     args = parser.parse_args()
 
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s - %(levelname)s - %(message)s",
     )
-    run(args.input, args.output, args.workers, args.jpeg_quality)
+    run(args.input, args.output, args.workers, args.jpeg_quality, args.selected_ids)
 
 
 if __name__ == "__main__":
