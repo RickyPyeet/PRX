@@ -138,14 +138,14 @@ def iter_tar_samples(tar_path: str) -> Iterator[tuple[str, dict[str, bytes]]]:
                 continue
             if key != current_key:
                 if current_key is not None and "jpg" in current and "json" in current:
-                    yield current_key, current # add current_key to yield 
+                    yield current_key, current
                 current_key = key
                 current = {}
             f = tf.extractfile(member)
             if f is not None:
                 current[ext] = f.read()
         if current_key is not None and "jpg" in current and "json" in current:
-            yield current_key, current # add current_key to yield
+            yield current_key, current
 
 
 # ---------------------------------------------------------------------------
@@ -242,9 +242,9 @@ def worker_fn(
     n_failed = 0
     start = time.time()
 
-    selected_ids = load_selected_ids(selected_ids_path) # set of selected ids
+    selected_ids = load_selected_ids(selected_ids_path) 
     log.info("Loaded %d selected sample IDs", len(selected_ids))
-    
+
     try:
         for tar_path in tar_files:
             subset = tar_path.rsplit("/", 2)[-2]
@@ -317,6 +317,8 @@ def run(
     input_dir: str, output_root: str, num_workers: int, jpeg_quality: int, selected_ids_path: str,
 ) -> None:
     os.makedirs(output_root, exist_ok=True)
+    
+    expected_samples = len(load_selected_ids(selected_ids_path))
 
     tar_files = sorted(glob(os.path.join(input_dir, "*/train-*.tar")))
     logger.info(
@@ -362,6 +364,13 @@ def run(
 
     elapsed = time.time() - start
     total = counter.value
+
+    if total != expected_samples:
+    raise RuntimeError(
+        f"Expected {expected_samples:,} selected samples, "
+        f"but wrote {total:,}"
+    )
+    
     logger.info(
         f"Processing done: {total:,} samples in {elapsed / 60:.0f}m ({total / elapsed:.0f}/s)"
     )
