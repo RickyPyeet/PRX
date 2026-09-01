@@ -366,11 +366,11 @@ def run(
     total = counter.value
 
     if total != expected_samples:
-    raise RuntimeError(
-        f"Expected {expected_samples:,} selected samples, "
-        f"but wrote {total:,}"
-    )
-    
+        raise RuntimeError(
+            f"Expected {expected_samples:,} selected samples, "
+            f"but wrote {total:,}"
+        )
+
     logger.info(
         f"Processing done: {total:,} samples in {elapsed / 60:.0f}m ({total / elapsed:.0f}/s)"
     )
