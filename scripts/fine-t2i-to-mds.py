@@ -217,10 +217,18 @@ def process_sample(
 # ---------------------------------------------------------------------------
 
 
-def load_selected_ids(csv_path: str) -> set[str]:
+def load_selected_ids(csv_path: str) -> set[str, str]:
+    selected = set()
+
     with open(csv_path, newline = "", encoding = 'utf-8') as f:
         reader = csv.DictReader(f)
-        return {row['sample_id'] for row in reader}
+
+        for row in reader:
+            selected.add((row['shard'], row['sample_id']))
+        
+    logger.info("Loaded %d selected samples", len(selected))
+
+    return selected
 
         
 # ---------------------------------------------------------------------------
@@ -248,9 +256,10 @@ def worker_fn(
     try:
         for tar_path in tar_files:
             subset = tar_path.rsplit("/", 2)[-2]
+            tar_name = tar_path.rsplit("/", 1)[-1]
 
             for sample_id, raw in iter_tar_samples(tar_path):
-                if sample_id not in selected_ids:
+                if (tar_name, sample_id) not in selected_ids:
                     continue
                 result = process_sample(raw["jpg"], raw["json"], subset, jpeg_quality)
                 if result is None:
