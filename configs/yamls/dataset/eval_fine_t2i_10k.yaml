@@ -1,0 +1,39 @@
+# @package dataset.eval_dataset
+# Fine-T2I evaluation dataset extracted from seeded curated images
+# Eval set used to experiment over TREAD token routing ratio
+
+_target_: prx.dataset.StreamingProcessedDataset
+local:
+  - /home/riccardo/prx-data/mds/reference_10k
+
+streaming:
+  _target_: prx.dataset.mds_dataset.StreamingConfig
+  cache_limit: 8tb
+  download_timeout: 7200
+  shuffle: true
+  shuffle_seed: 42
+  batching_method: device_per_stream
+
+processed:
+  _target_: prx.dataset.mds_dataset.ProcessedConfig
+  caption_keys:
+    - [prompt, 0.5]
+    - [enhanced_prompt, 0.5]
+  text_tower: ${diffusion_text_tower.preset_name}
+  prompt_max_tokens: 256
+  has_text_latents: false
+  has_mask_text_latents: false
+  transforms:
+    - _target_: prx.dataset.transforms.ArAwareResize
+      default_image_size: ${image_size}
+      patch_size_pixels: ${patch_size_pixels}
+  transforms_targets:
+    - image
+
+dataloader:
+  _target_: prx.dataset.mds_dataset.DataLoaderConfig
+  drop_last: true
+  prefetch_factor: 2
+  num_workers: 8
+  persistent_workers: true
+  pin_memory: true
