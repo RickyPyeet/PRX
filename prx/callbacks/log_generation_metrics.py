@@ -22,6 +22,9 @@ from composer.utils import dist
 from torch.nn.parallel import DistributedDataParallel
 from torchmetrics import Metric
 from torchmetrics.image.fid import FrechetInceptionDistance
+from torchmetrics.multimodal.clip_score import CLIPScore 
+from torchmetrics.functional.multimodal.clip_score import _clip_score_update
+from prdc import compute_prdc
 
 from .feature_extractors import CLIPFeatureExtractor, DINOFeatureExtractor
 from prx.dataset.constants import BatchKeys
@@ -278,6 +281,8 @@ class LogQualityMetrics(Callback):
         compute_fid: bool = True,
         compute_cmmd: bool = True,
         compute_dino_mmd: bool = True,
+        compute_density_coverage: bool = True,
+        compute_clip_score: bool = True,
         clip_model_name: str = "openai/clip-vit-large-patch14-336",
         dino_model_name: str = "dinov2_vitl14_reg",
         dino_resize_size: int = 518,
@@ -296,6 +301,8 @@ class LogQualityMetrics(Callback):
         self.compute_fid = compute_fid
         self.compute_cmmd = compute_cmmd
         self.compute_dino_mmd = compute_dino_mmd
+        self.compute_density_coverage = compute_density_coverage
+        self.compute_clip_score = compute_clip_score
 
         self.clip_model_name = clip_model_name
         self.dino_model_name = dino_model_name
@@ -313,6 +320,7 @@ class LogQualityMetrics(Callback):
 
         self.clip_extractor: CLIPFeatureExtractor | None = None
         self.dino_extractor: DINOFeatureExtractor | None = None
+        self.clip_score: CLIPScore | None = None
 
         self._run_this_eval = False
         self._samples_processed = 0
@@ -358,12 +366,29 @@ class LogQualityMetrics(Callback):
         model = self.get_model(state)
         device = model.denoiser_device
 
+        # Containers for inception extracted features
+        if self.compute_density_coverage:
+            self.real_features = []
+            self.gen_features = {scale: [] for scale in self.guidance_scales}
+        
+        # Containers for clip scores separation through prompts and enhanced_prompts
+        if self.compute_clip_score:
+            self.clip_group_stats = {
+                scale: {
+                    "prompt_sum": torch.tensor(0.0, device = device),
+                    "prompt_count": torch.tensor(0, device = device),
+                    "enhanced_sum": torch.tensor(0.0, device = device),
+                    "enhanced_count": torch.tensor(0, device = device)
+                }
+                for scale in self.guidance_scales
+            }
+
         if not self._metrics_initialized:
             self.metrics = {}
 
             if self.compute_fid:
                 self.metrics["FID"] = {
-                    scale: FrechetInceptionDistance(normalize=True).to(device) for scale in self.guidance_scales
+                    scale: FrechetInceptionDistance(normalize=False).to(device) for scale in self.guidance_scales
                 }
 
             if self.compute_cmmd:
@@ -401,12 +426,24 @@ class LogQualityMetrics(Callback):
                     for scale in self.guidance_scales
                 }
 
+            if self.compute_clip_score:
+                assert isinstance(self.clip_model_name, str), f"Need clip_model_name to instantiate CLIP, got {self.clip_model_name} as {type(self.clip_model_name)}"
+                self.clip_score = CLIPScore(
+                        model_name_or_path = self.clip_model_name
+                    ).to(device)
+
+            if self.compute_density_coverage:
+                assert 'FID' in self.metrics.keys(), "FID must be instantiated to use its inception function"
+                self.inception = self.metrics['FID'][self.guidance_scales[0]].inception
+
             self._metrics_initialized = True
         else:
             if self.clip_extractor is not None:
                 self.clip_extractor.to(device)
             if self.dino_extractor is not None:
                 self.dino_extractor.to(device)
+            if self.clip_score is not None:
+                self.clip_score.to(device)
 
     @torch.inference_mode()  # type: ignore
     def eval_batch_end(self, state: State, logger: Logger) -> None:
@@ -447,6 +484,14 @@ class LogQualityMetrics(Callback):
         if real_images.ndim == 4 and real_images.shape[-1] in (1, 3):
             real_images = real_images.permute(0, 3, 1, 2).contiguous()
 
+        if self.compute_density_coverage:
+            inception_device = next(self.metrics['FID'][self.guidance_scales[0]].parameters()).device
+            real_inception = self.inception(real_images.to(inception_device))
+            self.real_features.append(real_inception.detach().float().cpu())
+
+        if self.compute_clip_score:
+            clip_device = next(self.clip_score.parameters()).device
+        
         for guidance_scale in self.guidance_scales:
             gen_images = model.generate(
                 batch=batch,
@@ -479,6 +524,34 @@ class LogQualityMetrics(Callback):
 
                 metric.update(real_slice, real=True)
                 metric.update(gen_slice, real=False)
+            
+            # Compute density and coverage
+            if self.compute_density_coverage:
+                gen_inception = self.inception(gen_images.to(inception_device))
+                self.gen_features[guidance_scale].append(gen_inception.detach().float().cpu())
+
+            # Compute CLIP Score
+            if self.compute_clip_score:
+                prompts = batch[BatchKeys.PROMPT]
+                caption_keys = batch[BatchKeys.CAPTION_KEY]
+
+                # Update CLIP and extract per-sample metrics - same as doing clip_metric.update()
+                scores, _ = _clip_score_update(
+                    source = gen_images.to(clip_device, non_blocking = True),
+                    target = prompts,
+                    model = self.clip_score.model,
+                    processor = self.clip_score.processor
+                )
+
+                prompt_mask = torch.tensor([key == 'prompt' for key in caption_keys], device = scores.device)
+                enhanced_mask = torch.tensor([key == 'enhanced_prompt' for key in caption_keys], device = scores.device)
+
+                # Update clip_group_stats
+                self.clip_group_stats[guidance_scale]['prompt_sum'] += scores[prompt_mask].sum()
+                self.clip_group_stats[guidance_scale]['prompt_count'] += scores[prompt_mask].numel()
+                
+                self.clip_group_stats[guidance_scale]['enhanced_sum'] += scores[enhanced_mask].sum()
+                self.clip_group_stats[guidance_scale]['enhanced_count'] += scores[enhanced_mask].numel()    
 
         self._samples_processed += batch_size
 
@@ -508,6 +581,48 @@ class LogQualityMetrics(Callback):
                                   dist.get_global_rank(), metric_type, scale, type(e).__name__, e)
                 finally:
                     metric.reset()
+        
+        if self.compute_density_coverage:
+            concat_real = torch.concat(self.real_features, dim = 0)
+            for scale in self.guidance_scales:
+                scale_str = str(scale).replace(".", "p")
+                concat_gen = torch.concat(self.gen_features[scale], dim = 0)
+                prdc_metrics = compute_prdc(real_features = concat_real.numpy(), fake_features = concat_gen.numpy(), nearest_k = 5)
+                for metric_type in ['density', 'coverage']:
+                    metric_name = f"metrics/eval/{metric_type}_scale_{scale_str}"
+                    logger.log_metrics({metric_name: prdc_metrics[metric_type]}, step=state.timestamp.batch.value)
+
+        if self.compute_clip_score:
+            for scale in self.guidance_scales:
+                scale_str = str(scale).replace(".", "p")
+                # Extract values
+                prompt_sum = self.clip_group_stats[scale]['prompt_sum']
+                prompt_count = self.clip_group_stats[scale]['prompt_count']
+                enhanced_sum = self.clip_group_stats[scale]['enhanced_sum']
+                enhanced_count = self.clip_group_stats[scale]['enhanced_count']
+
+                # Compute CLIP scores
+                if prompt_count > 0:
+                    mean_prompt = prompt_sum / prompt_count
+                    clip_prompt = torch.clamp(mean_prompt, min = 0.0)
+                else:
+                    clip_prompt = torch.tensor(float('nan'), device = prompt_sum.device)
+
+                if enhanced_count > 0:
+                    mean_enhanced = enhanced_sum / enhanced_count
+                    clip_enhanced = torch.clamp(mean_enhanced, min = 0.0)
+                else:
+                    clip_enhanced = torch.tensor(float('nan'), device = enhanced_sum.device)
+
+                if prompt_count > 0 or enhanced_count > 0:
+                    mean_overall = (prompt_sum + enhanced_sum) / (prompt_count + enhanced_count)
+                    clip_overall = torch.clamp(mean_overall, min = 0.0)
+                else:
+                    clip_overall = torch.tensor(float('nan'), device = prompt_sum.device)
+                
+                for metric_type, clip_score in zip(['clip_prompt', 'clip_enhanced', 'clip_overall'], [clip_prompt, clip_enhanced, clip_overall]):
+                    metric_name = f"metrics/eval/{metric_type}_scale_{scale_str}"
+                    logger.log_metrics({metric_name: clip_score.detach().float().cpu().item()}, step=state.timestamp.batch.value)
 
     def eval_end(self, state: State, logger: Logger) -> None:
         if not self._run_this_eval:
@@ -530,3 +645,5 @@ class LogQualityMetrics(Callback):
             self.clip_extractor.to("cpu")
         if self.dino_extractor is not None:
             self.dino_extractor.to("cpu")
+        if self.clip_score is not None:
+            self.clip_score.to("cpu")
