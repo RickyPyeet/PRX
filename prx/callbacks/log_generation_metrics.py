@@ -1,5 +1,5 @@
 """
-Callback for computing generation quality metrics (FID, CMMD, DINO-MMD) during evaluation,
+Callback for computing generation quality metrics (FID, CMMD, DINO-MMD, CLIP, Density and Coverage) during evaluation,
 with configurable frequency like '100ba', '1ep', '5000sp', or an int (batches).
 
 CMMD here matches sayakpaul/cmmd-pytorch's distance.py:
@@ -143,7 +143,7 @@ class RBFMMDMetric(Metric):
         chunk_size: int = 1024,
         store_on_cpu: bool = True,
     ):
-        super().__init__(dist_sync_on_step=False)
+        super().__init__(dist_sync_on_step=False, sync_on_compute = False)
 
         self.feature_extractor = feature_extractor
         self.sigma = float(sigma)
@@ -211,6 +211,170 @@ class RBFMMDMetric(Metric):
             real_local.to(device), fake_local.to(device), sigma=self.sigma, scale=self.scale, chunk_size=self.chunk_size
         )
 
+    def reset(self) -> None:
+        super().reset()
+        self.real_feats.clear()
+        self.fake_feats.clear()
+
+class CLIPScoreMetric(Metric):
+    """
+    A torchmetrics.Metric that computes CLIP scores on separate `prompt` and `enhanced_prompt`.
+    Args:
+
+    - update()
+    - compute()
+    """
+    def __init__(
+        self,
+        clip_model: nn.Module,
+    ):
+        super().__init__(dist_sync_on_step = False)
+
+        self.clip_model = clip_model
+
+        self.add_state("prompt_sum", default = torch.tensor(0.0), dist_reduce_fx = "sum")
+        self.add_state("prompt_count", default = torch.tensor(0), dist_reduce_fx = "sum")
+        self.add_state("enhanced_sum", default = torch.tensor(0.0), dist_reduce_fx = "sum")
+        self.add_state("enhanced_count", default = torch.tensor(0), dist_reduce_fx = "sum")
+    
+
+    @torch.inference_mode()
+    def update(
+        self,
+        images: torch.Tensor,
+        prompts: Sequence[str],
+        caption_keys: Sequence[str]
+):
+        scores, _ = _clip_score_update(
+            source = images,
+            target = prompts,
+            model = self.clip_model.model,
+            processor = self.clip_model.processor
+        )
+        prompt_mask = torch.tensor([key == 'prompt' for key in caption_keys], device = scores.device)
+        enhanced_mask = torch.tensor([key == 'enhanced_prompt' for key in caption_keys], device = scores.device) 
+
+        self.prompt_sum += scores[prompt_mask].sum()
+        self.prompt_count += scores[prompt_mask].numel()
+        self.enhanced_sum += scores[enhanced_mask].sum()
+        self.enhanced_count += scores[enhanced_mask].numel()
+
+    def compute(self):
+        if self.prompt_count > 0:
+            clip_prompt = self.prompt_sum / self.prompt_count
+            clip_prompt = torch.clamp(clip_prompt, min = 0.0)
+        else:
+            clip_prompt = torch.tensor(float('nan'), device = self.prompt_sum.device)
+
+        if self.enhanced_count > 0:
+            clip_enhanced = self.enhanced_sum / self.enhanced_count
+            clip_enhanced = torch.clamp(clip_enhanced, min = 0.0)
+        else:
+            clip_enhanced = torch.tensor(float('nan'), device = self.enhanced_sum.device)
+
+        if self.prompt_count > 0 or self.enhanced_count > 0:
+            clip_overall = (self.prompt_sum + self.enhanced_sum) / (self.prompt_count + self.enhanced_count)
+            clip_overall = torch.clamp(clip_overall, min = 0.0)
+        else:
+            clip_overall = torch.tensor(float('nan'), device = self.enhanced_sum.device)
+
+        return {
+            'clip_prompt': clip_prompt,
+            'clip_enhanced': clip_enhanced,
+            'clip_overall': clip_overall
+            }
+
+class PRDCMetric(Metric):
+
+    is_differentiable = False
+    higher_is_better = True
+    full_state_update = False
+
+    def __init__(
+        self,
+        feature_extractor: nn.Module,
+        k_neighbors: int = 5,
+        store_on_cpu: bool = True
+        ):
+        super().__init__(dist_sync_on_step = False, sync_on_compute = False) # set sync_on_compute = False to avoid automatic distributed state sync before manual gather
+        
+        self.feature_extractor = feature_extractor
+        self.k_neighbors = k_neighbors
+        self.store_on_cpu = store_on_cpu
+
+        self.add_state("real_feats", default = [], dist_reduce_fx = None)
+        self.add_state("fake_feats", default = [], dist_reduce_fx = None)
+
+    @torch.inference_mode()
+    def update(
+        self,
+        images: torch.Tensor,
+        real: bool) -> None:
+        feats = self.feature_extractor(images)
+        feats = feats.detach().float()
+        if self.store_on_cpu:
+            feats = feats.cpu()
+
+        if real:
+            self.real_feats.append(feats)
+        else:
+            self.fake_feats.append(feats)
+
+    @torch.inference_mode()
+    def compute(self) -> dict[str, torch.Tensor]:
+        if len(self.real_feats) == 0 or len(self.fake_feats) == 0:
+            prdc_metric = {
+                'density': torch.tensor(float('nan'), device = self.device, dtype = torch.float32),
+                'coverage': torch.tensor(float('nan'), device = self.device, dtype = torch.float32)}
+            return prdc_metric
+
+        real_local = torch.cat(list(self.real_feats), dim = 0)
+        fake_local = torch.cat(list(self.fake_feats), dim = 0)
+
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            backend = torch.distributed.get_backend()
+            backend_str = backend if isinstance(backend, str) else str(backend)
+            backend_str = backend_str.lower()
+
+            if backend_str == "nccl":
+                if not torch.cuda.is_available():
+                    raise RuntimeError("NCCL backend requires CUDA tensors, but CUDA is not available")
+                compute_device = torch.device("cuda", torch.cuda.current_device())
+            else:
+                compute_device = torch.device("cpu")
+
+            real_local = real_local.to(compute_device, non_blocking = True)
+            fake_local = fake_local.to(compute_device, non_blocking = True)
+
+            rank = torch.distributed.get_rank()
+            real_global = _gather_cat_to_rank0(real_local)
+            fake_global = _gather_cat_to_rank0(fake_local)
+
+            if rank == 0:
+                real_global = real_global.detach().cpu()
+                fake_global = fake_global.detach().cpu()
+                prdc_metric = compute_prdc(real_global.numpy(), fake_global.numpy(), nearest_k = self.k_neighbors)
+                
+                # Tensor for broadcasting
+                prdc_tensor = torch.tensor([prdc_metric['density'], prdc_metric['coverage']], device = compute_device, dtype = torch.float32)
+            else:
+                prdc_tensor = torch.zeros(2, device = compute_device)
+
+            torch.distributed.broadcast(prdc_tensor, src = 0)
+            return {
+                'density': prdc_tensor[0],
+                'coverage': prdc_tensor[1]
+            }
+        
+        real_local = real_local.detach().cpu()
+        fake_local = fake_local.detach().cpu()
+        prdc_metric = compute_prdc(real_local.numpy(), fake_local.numpy(), nearest_k = self.k_neighbors)
+
+        return {
+            'density': torch.tensor(prdc_metric['density'], device = self.device, dtype = torch.float32),
+            'coverage': torch.tensor(prdc_metric['coverage'], device = self.device, dtype = torch.float32)
+        }
+    
     def reset(self) -> None:
         super().reset()
         self.real_feats.clear()
@@ -289,6 +453,7 @@ class LogQualityMetrics(Callback):
         mmd_sigma: float = 10.0,
         mmd_scale: float = 1000.0,
         mmd_chunk_size: int = 1024,
+        k_neighbors: int = 5,
         clip_use_pil: bool = True,
         store_feats_on_cpu: bool = False,
     ) -> None:
@@ -311,6 +476,8 @@ class LogQualityMetrics(Callback):
         self.mmd_sigma = float(mmd_sigma)
         self.mmd_scale = float(mmd_scale)
         self.mmd_chunk_size = int(mmd_chunk_size)
+
+        self.k_neighbors = k_neighbors
 
         self.clip_use_pil = bool(clip_use_pil)
         self.store_feats_on_cpu = bool(store_feats_on_cpu)
@@ -366,23 +533,6 @@ class LogQualityMetrics(Callback):
         model = self.get_model(state)
         device = model.denoiser_device
 
-        # Containers for inception extracted features
-        if self.compute_density_coverage:
-            self.real_features = []
-            self.gen_features = {scale: [] for scale in self.guidance_scales}
-        
-        # Containers for clip scores separation through prompts and enhanced_prompts
-        if self.compute_clip_score:
-            self.clip_group_stats = {
-                scale: {
-                    "prompt_sum": torch.tensor(0.0, device = device),
-                    "prompt_count": torch.tensor(0, device = device),
-                    "enhanced_sum": torch.tensor(0.0, device = device),
-                    "enhanced_count": torch.tensor(0, device = device)
-                }
-                for scale in self.guidance_scales
-            }
-
         if not self._metrics_initialized:
             self.metrics = {}
 
@@ -431,10 +581,26 @@ class LogQualityMetrics(Callback):
                 self.clip_score = CLIPScore(
                         model_name_or_path = self.clip_model_name
                     ).to(device)
+                
+                self.metrics["CLIP"] = {
+                    scale: CLIPScoreMetric(
+                        clip_model = self.clip_score,
+                    ).to(device)
+                    for scale in self.guidance_scales
+                }
 
             if self.compute_density_coverage:
                 assert 'FID' in self.metrics.keys(), "FID must be instantiated to use its inception function"
                 self.inception = self.metrics['FID'][self.guidance_scales[0]].inception
+
+                self.metrics["PRDC"] = {
+                    scale: PRDCMetric(
+                        feature_extractor = self.inception,
+                        k_neighbors = self.k_neighbors,
+                        store_on_cpu = self.store_feats_on_cpu
+                    ).to(device)
+                    for scale in self.guidance_scales
+                }
 
             self._metrics_initialized = True
         else:
@@ -483,14 +649,6 @@ class LogQualityMetrics(Callback):
         real_images = torch.clamp(real_images * 255.0, 0, 255).to(torch.uint8)
         if real_images.ndim == 4 and real_images.shape[-1] in (1, 3):
             real_images = real_images.permute(0, 3, 1, 2).contiguous()
-
-        if self.compute_density_coverage:
-            inception_device = next(self.metrics['FID'][self.guidance_scales[0]].parameters()).device
-            real_inception = self.inception(real_images.to(inception_device))
-            self.real_features.append(real_inception.detach().float().cpu())
-
-        if self.compute_clip_score:
-            clip_device = next(self.clip_score.parameters()).device
         
         for guidance_scale in self.guidance_scales:
             gen_images = model.generate(
@@ -522,36 +680,14 @@ class LogQualityMetrics(Callback):
                 real_slice = real_images.to(metric_device, non_blocking=True)
                 gen_slice = gen_images.to(metric_device, non_blocking=True)
 
-                metric.update(real_slice, real=True)
-                metric.update(gen_slice, real=False)
-            
-            # Compute density and coverage
-            if self.compute_density_coverage:
-                gen_inception = self.inception(gen_images.to(inception_device))
-                self.gen_features[guidance_scale].append(gen_inception.detach().float().cpu())
-
-            # Compute CLIP Score
-            if self.compute_clip_score:
-                prompts = batch[BatchKeys.PROMPT]
-                caption_keys = batch[BatchKeys.CAPTION_KEY]
-
-                # Update CLIP and extract per-sample metrics - same as doing clip_metric.update()
-                scores, _ = _clip_score_update(
-                    source = gen_images.to(clip_device, non_blocking = True),
-                    target = prompts,
-                    model = self.clip_score.model,
-                    processor = self.clip_score.processor
-                )
-
-                prompt_mask = torch.tensor([key == 'prompt' for key in caption_keys], device = scores.device)
-                enhanced_mask = torch.tensor([key == 'enhanced_prompt' for key in caption_keys], device = scores.device)
-
-                # Update clip_group_stats
-                self.clip_group_stats[guidance_scale]['prompt_sum'] += scores[prompt_mask].sum()
-                self.clip_group_stats[guidance_scale]['prompt_count'] += scores[prompt_mask].numel()
-                
-                self.clip_group_stats[guidance_scale]['enhanced_sum'] += scores[enhanced_mask].sum()
-                self.clip_group_stats[guidance_scale]['enhanced_count'] += scores[enhanced_mask].numel()    
+                # If metric is CLIP, update metric accordingly
+                if metric_type == 'CLIP':
+                    prompts = batch[BatchKeys.PROMPT]
+                    caption_keys = batch[BatchKeys.CAPTION_KEY]
+                    metric.update(images = gen_slice, prompts = prompts, caption_keys = caption_keys)
+                else:
+                    metric.update(real_slice, real=True)
+                    metric.update(gen_slice, real=False)
 
         self._samples_processed += batch_size
 
@@ -563,15 +699,28 @@ class LogQualityMetrics(Callback):
             for scale, metric in metrics_dict.items():
                 try:
                     score = metric.compute()
-                    score_val = score.detach().float().cpu().item()
 
-                    scale_str = str(scale).replace(".", "p")
-                    metric_name = f"metrics/eval/{metric_type}_scale_{scale_str}"
+                    # If CLIP or PRDC log its dictionary else log std metric
+                    if metric_type in ['CLIP', 'PRDC']:
+                        for name, out in score.items():
+                            score_val = out.detach().float().cpu().item()
+                            scale_str = str(scale).replace(".", "p")
+                            metric_name = f"metrics/eval/{name}_scale_{scale_str}"
 
-                    if dist.get_global_rank() == 0:
-                        _logger.info("Logging %s: %s", metric_name, score_val)
+                            if dist.get_global_rank() == 0:
+                                _logger.info("Logging %s: %s", metric_name, score_val)
 
-                    logger.log_metrics({metric_name: score_val}, step=state.timestamp.batch.value)
+                            logger.log_metrics({metric_name: score_val}, step=state.timestamp.batch.value)
+                    else:
+                        score_val = score.detach().float().cpu().item()
+
+                        scale_str = str(scale).replace(".", "p")
+                        metric_name = f"metrics/eval/{metric_type}_scale_{scale_str}"
+
+                        if dist.get_global_rank() == 0:
+                            _logger.info("Logging %s: %s", metric_name, score_val)
+
+                        logger.log_metrics({metric_name: score_val}, step=state.timestamp.batch.value)
 
                 except RuntimeError as e:
                     _logger.error("Rank %d: Error computing %s for scale %s: %s",
@@ -582,48 +731,6 @@ class LogQualityMetrics(Callback):
                 finally:
                     metric.reset()
         
-        if self.compute_density_coverage:
-            concat_real = torch.concat(self.real_features, dim = 0)
-            for scale in self.guidance_scales:
-                scale_str = str(scale).replace(".", "p")
-                concat_gen = torch.concat(self.gen_features[scale], dim = 0)
-                prdc_metrics = compute_prdc(real_features = concat_real.numpy(), fake_features = concat_gen.numpy(), nearest_k = 5)
-                for metric_type in ['density', 'coverage']:
-                    metric_name = f"metrics/eval/{metric_type}_scale_{scale_str}"
-                    logger.log_metrics({metric_name: prdc_metrics[metric_type]}, step=state.timestamp.batch.value)
-
-        if self.compute_clip_score:
-            for scale in self.guidance_scales:
-                scale_str = str(scale).replace(".", "p")
-                # Extract values
-                prompt_sum = self.clip_group_stats[scale]['prompt_sum']
-                prompt_count = self.clip_group_stats[scale]['prompt_count']
-                enhanced_sum = self.clip_group_stats[scale]['enhanced_sum']
-                enhanced_count = self.clip_group_stats[scale]['enhanced_count']
-
-                # Compute CLIP scores
-                if prompt_count > 0:
-                    mean_prompt = prompt_sum / prompt_count
-                    clip_prompt = torch.clamp(mean_prompt, min = 0.0)
-                else:
-                    clip_prompt = torch.tensor(float('nan'), device = prompt_sum.device)
-
-                if enhanced_count > 0:
-                    mean_enhanced = enhanced_sum / enhanced_count
-                    clip_enhanced = torch.clamp(mean_enhanced, min = 0.0)
-                else:
-                    clip_enhanced = torch.tensor(float('nan'), device = enhanced_sum.device)
-
-                if prompt_count > 0 or enhanced_count > 0:
-                    mean_overall = (prompt_sum + enhanced_sum) / (prompt_count + enhanced_count)
-                    clip_overall = torch.clamp(mean_overall, min = 0.0)
-                else:
-                    clip_overall = torch.tensor(float('nan'), device = prompt_sum.device)
-                
-                for metric_type, clip_score in zip(['clip_prompt', 'clip_enhanced', 'clip_overall'], [clip_prompt, clip_enhanced, clip_overall]):
-                    metric_name = f"metrics/eval/{metric_type}_scale_{scale_str}"
-                    logger.log_metrics({metric_name: clip_score.detach().float().cpu().item()}, step=state.timestamp.batch.value)
-
     def eval_end(self, state: State, logger: Logger) -> None:
         if not self._run_this_eval:
             return
