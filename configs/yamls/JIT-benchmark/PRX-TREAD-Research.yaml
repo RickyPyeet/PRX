@@ -1,0 +1,20 @@
+defaults:
+  - JIT-TREAD-Baseline
+  - _self_
+
+group: JIT-Benchmark
+name: PRX_TREAD_Research
+
+algorithms:
+  tread:
+    _target_: prx.algorithm.tread.Tread
+    route_start: 2
+    route_end: 12
+    routing_probability: 0.5
+    detach: false
+    seed: 42
+    train_only: true
+    self_guidance: true
+
+trainer:
+  save_folder: checkpoints/PRX-TREAD-Research
