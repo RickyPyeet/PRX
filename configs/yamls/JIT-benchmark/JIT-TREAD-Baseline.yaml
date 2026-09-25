@@ -20,9 +20,9 @@ nccl_sleep: 1
 activation_memory_budget: 1
 image_size: 1024
 patch_size_pixels: 32
-global_batch_size: 8
-device_train_microbatch_size: 8 
-device_eval_microbatch_size: 8
+global_batch_size: 256
+device_train_microbatch_size: 32
+device_eval_microbatch_size: 32
 seed: 42
 eval_first: false
 compile_denoiser: true
@@ -97,8 +97,10 @@ callbacks:
     seed: 42
     num_inference_steps: 50
     compute_fid: true
-    compute_cmmd: true
-    compute_dino_mmd: true
+    compute_cmmd: false
+    compute_dino_mmd: false
+    compute_density_coverage: true
+    compute_clip_score: true
     max_samples: 10_000
 
 trainer:
@@ -113,9 +115,9 @@ trainer:
   scale_schedule_ratio: 1.0
   save_folder: checkpoints/JIT-baseline
   save_interval: 2_500ba
-  save_num_checkpoints_to_keep: 1
+  save_num_checkpoints_to_keep: 2
   save_overwrite: true  
-  save_weights_only: true
+  save_weights_only: false
   save_ignore_keys:
     - state/model/vae*
     - state/model/text_tower*
