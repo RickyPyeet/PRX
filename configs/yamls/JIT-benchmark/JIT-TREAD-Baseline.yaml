@@ -40,6 +40,10 @@ algorithms:
     layer_index: 7
     encoder: "dinov2_vitl14_reg"
     compile_encoder: true
+    
+  raw_gradient_monitor:
+    _target_: prx.algorithm.RawGradientMonitor
+    log_interval: 100
 
 
 model:
@@ -120,7 +124,7 @@ trainer:
   run_name: ${group}-${name}
   seed: ${seed}
   scale_schedule_ratio: 1.0
-  save_folder: checkpoints/JIT-baseline
+  save_folder: checkpoints/JIT-TREAD-Baseline
   save_interval: 2_500ba
   save_num_checkpoints_to_keep: 2
   save_overwrite: true  
