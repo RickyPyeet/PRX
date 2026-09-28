@@ -6,6 +6,7 @@ from prx.algorithm.contrastive_flow_matching import ContrastiveFlowMatching
 from prx.algorithm.lpips import LPIPS
 from prx.algorithm.perceptual_dino import PerceptualDINO
 from prx.algorithm.resolution_aware import ResolutionAware
+from prx.algorithm.raw_gradient_monitor import RawGradientMonitor
 
 
-__all__ = ["EMA", "REPA", "Tread", "SPRINT", "ContrastiveFlowMatching", "PerceptualDINO", "LPIPS", "ResolutionAware"]
+__all__ = ["EMA", "REPA", "Tread", "SPRINT", "ContrastiveFlowMatching", "PerceptualDINO", "LPIPS", "ResolutionAware", "RawGradientMonitor"]
