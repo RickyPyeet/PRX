@@ -49,7 +49,7 @@ class RawGradientMonitor(Algorithm):
                     self.param_mapping[id(param)] = block_idx
             
             # Extract mesh shard group
-            self.shard_group = mesh_2d.get_group(mesh_dim = "dp_shard")
+            self.shard_group = mesh_2d.get_group(mesh_dim = "data_parallel_shard")
 
         if event == Event.AFTER_TRAIN_BATCH:
             # Check if logging happens
