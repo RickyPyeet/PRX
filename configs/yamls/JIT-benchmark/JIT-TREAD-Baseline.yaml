@@ -103,7 +103,7 @@ callbacks:
     seed: 42
   generation_metrics:
     _target_: prx.callbacks.LogQualityMetrics
-    frequency: 10_000ba
+    frequency: 1_000ba
     guidance_scales: [3.5]
     seed: 42
     num_inference_steps: 50
@@ -112,7 +112,7 @@ callbacks:
     compute_dino_mmd: false
     compute_density_coverage: true
     compute_clip_score: true
-    max_samples: 10_000
+    max_samples: 1_000
 
 trainer:
   _target_: composer.Trainer
