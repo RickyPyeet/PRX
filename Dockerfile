@@ -4,6 +4,7 @@ FROM nvidia/cuda:12.6.3-cudnn-devel-ubuntu24.04
 # Install Python 3.12 and basic development tools
 RUN apt-get update && apt-get install -y --no-install-recommends \
     python3.12 \
+    python3.12-dev \
     python3.12-venv \
     python3-pip \
     curl \
