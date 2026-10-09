@@ -125,7 +125,7 @@ trainer:
   seed: ${seed}
   scale_schedule_ratio: 1.0
   save_folder: checkpoints/JIT-TREAD-Baseline
-  save_interval: 2_500ba
+  save_interval: 1_000ba
   save_num_checkpoints_to_keep: 2
   save_overwrite: true  
   save_weights_only: false

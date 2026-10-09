@@ -14,7 +14,7 @@ algorithms:
     detach: false
     seed: 42
     train_only: true
-    self_guidance: true
+    self_guidance: false
 
 trainer:
   save_folder: checkpoints/PRX-TREAD-Research
