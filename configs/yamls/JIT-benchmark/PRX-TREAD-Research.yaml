@@ -1,3 +1,4 @@
+# @package _global_
 defaults:
   - JIT-TREAD-Baseline
   - _self_
