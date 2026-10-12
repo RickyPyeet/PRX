@@ -37,6 +37,7 @@ dependencies = [
     "Pillow",
     "pyyaml",
     "muon-fsdp2",
+    "prdc>=0.2",
 ]
 
 [project.optional-dependencies]
