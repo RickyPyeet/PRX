@@ -111,9 +111,20 @@ def train(config: DictConfig) -> None:
 
     # Save config file in the checkpoint folder
     # create the checkpoint folder if it doesn't exist
-    Path(config.trainer.save_folder).mkdir(parents=True, exist_ok=True)
-    with open(Path(config.trainer.save_folder) / "config.yaml", "w") as f:
+    save_folder = str(config.trainer.save_folder)
+
+    if "://" in save_folder:
+        config_dir = Path("checkpoint_configs") / str(config.trainer.run_name) # Add lines to handle s3 cloud storage address 
+    else:
+        config_dir = Path(save_folder)
+
+    config_dir.mkdir(parents = True, exist_ok = True)
+    with open(config_dir / "config.yaml", "w") as f:
         OmegaConf.save(config, f)
+
+    # Path(config.trainer.save_folder).mkdir(parents=True, exist_ok=True)
+    # with open(Path(config.trainer.save_folder) / "config.yaml", "w") as f:
+    #    OmegaConf.save(config, f)
 
     # Instantiate trainer
     trainer: Trainer = hydra.utils.instantiate(
