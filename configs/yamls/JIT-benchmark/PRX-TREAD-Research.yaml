@@ -18,4 +18,4 @@ algorithms:
     self_guidance: false
 
 trainer:
-  save_folder: s3://prx-data/checkpoints/baseline
+  save_folder: s3://prx-data/checkpoints/tread-0.5
