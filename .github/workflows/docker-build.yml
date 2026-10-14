@@ -1,6 +1,9 @@
 name: Build PRX Docker Image
 
 on:
+  push:
+    branches:
+      - research/tread-routing-study
   workflow_dispatch:
 
 permissions:
