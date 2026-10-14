@@ -16,6 +16,7 @@ project: PRX-TREAD-Research
 group: PRX-JIT-Benchmark-1024px
 name: Baseline
 nccl_sleep: 1
+wandb_run_id: null
 
 activation_memory_budget: 1
 image_size: 1024
@@ -81,6 +82,9 @@ logger:
     project: ${project}
     group: ${group}
     name: ${name}
+    init_kwargs:
+      id: ${wandb_run_id}
+      resume: allow
 
 callbacks:
   speed_monitor:
@@ -125,7 +129,7 @@ trainer:
   seed: ${seed}
   scale_schedule_ratio: 1.0
   save_folder: checkpoints/JIT-TREAD-Baseline
-  save_interval: 1_000ba
+  save_interval: 500ba
   save_num_checkpoints_to_keep: 2
   save_overwrite: true  
   save_weights_only: false
